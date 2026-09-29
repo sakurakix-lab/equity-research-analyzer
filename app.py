@@ -175,6 +175,7 @@ HELP = {
     "score_suggest": "Rules-based starting scores from available data. Always override with your own judgment — these are prompts, not answers.",
     "next_earnings": "Scheduled report date. Stocks often reprice into and after earnings. Position size and stops are usually adjusted when the event is near.",
     "workflow": "A simple checklist to keep analysis disciplined: data → thesis → levels → risk → decision.",
+    "entry_exit": "Suggested levels from support, resistance, moving averages, and ATR. Use as a starting framework only — not automated trade signals. Always set your own invalidation.",
 }
 
 def help_box(key, label=None):
@@ -283,6 +284,58 @@ def ma_distances(close, ma20, ma50, ma200=None):
     if ma200 and close:
         out["vs MA200"] = (close / ma200 - 1) * 100
     return out
+
+def suggest_entry_exit(candles_payload, price=None):
+    """
+    From Finnhub candle payload, suggest long entry / stop / target.
+    Returns dict with Entry, Stop, Target, R:R, Bias or Nones.
+    """
+    empty = {"Entry": None, "Stop": None, "Target": None, "R:R": None, "Bias": "—"}
+    if not candles_payload or safe_get(candles_payload, "s") != "ok":
+        return empty
+    try:
+        df = pd.DataFrame({
+            "Date": pd.to_datetime(candles_payload["t"], unit="s"),
+            "Open": candles_payload["o"],
+            "High": candles_payload["h"],
+            "Low": candles_payload["l"],
+            "Close": candles_payload["c"],
+        }).set_index("Date").sort_index()
+        if len(df) < 30:
+            return empty
+        df["MA20"] = df["Close"].rolling(20).mean()
+        df["MA50"] = df["Close"].rolling(50).mean()
+        atr = compute_atr(df)
+        latest_close = float(price) if price not in (None, "—") else float(df["Close"].iloc[-1])
+        atr_v = float(atr.dropna().iloc[-1]) if not atr.dropna().empty else latest_close * 0.02
+        support, resist = find_swing_levels(df)
+        nearest_sup = None
+        if support:
+            below = [s for s in support if s < latest_close]
+            nearest_sup = max(below) if below else min(support)
+        nearest_res = None
+        if resist:
+            above = [r for r in resist if r > latest_close]
+            nearest_res = min(above) if above else max(resist)
+        ma20_v = float(df["MA20"].iloc[-1]) if not df["MA20"].isna().iloc[-1] else None
+        trend = classify_trend(df["Close"], 20, 50)
+        long_entry = nearest_sup if nearest_sup else (ma20_v if ma20_v else latest_close * 0.98)
+        if ma20_v and nearest_sup and trend != "Downtrend":
+            long_entry = nearest_sup + (latest_close - nearest_sup) * 0.25
+        long_stop = (nearest_sup - atr_v) if nearest_sup else (latest_close - 1.5 * atr_v)
+        long_t1 = nearest_res if nearest_res else (latest_close + 2 * atr_v)
+        risk = abs(long_entry - long_stop) if long_stop else atr_v
+        reward = abs(long_t1 - long_entry) if long_t1 else atr_v
+        rr = round(reward / risk, 1) if risk and risk > 0 else None
+        return {
+            "Entry": round(long_entry, 2),
+            "Stop": round(long_stop, 2),
+            "Target": round(long_t1, 2),
+            "R:R": rr,
+            "Bias": trend,
+        }
+    except Exception:
+        return empty
 
 def simple_dcf(fcf0, growth_rate, terminal_growth, wacc, shares, net_debt=0, years=5):
     if wacc <= terminal_growth or wacc <= 0 or shares <= 0:
@@ -418,9 +471,11 @@ with st.sidebar:
                 help="Quotes, metrics, next earnings for all watchlist names",
             )
         if run_batch and api_key:
-            with st.spinner("Running batch analysis on watchlist…"):
+            with st.spinner("Running batch analysis (quotes, levels, earnings)…"):
                 today_s = datetime.now().strftime("%Y-%m-%d")
                 fwd_s = (datetime.now() + timedelta(days=90)).strftime("%Y-%m-%d")
+                end_ts = int(datetime.now().timestamp())
+                start_ts = int((datetime.now() - timedelta(days=250)).timestamp())
                 batch_rows = []
                 for sym in st.session_state["watchlist"][:10]:
                     q = finnhub_get("quote", api_key, symbol=sym)
@@ -432,6 +487,10 @@ with st.sidebar:
                         api_key,
                         symbol=sym,
                         **{"from": today_s, "to": fwd_s},
+                    )
+                    candles_sym = finnhub_get(
+                        "stock/candle", api_key, symbol=sym,
+                        resolution="D", _from=start_ts, to=end_ts,
                     )
                     next_e = None
                     if cal and isinstance(cal, dict):
@@ -447,23 +506,25 @@ with st.sidebar:
                             ).days
                         except Exception:
                             pass
+                    px = safe_get(q, "c")
+                    levels = suggest_entry_exit(candles_sym, px)
                     batch_rows.append({
                         "Ticker": sym,
-                        "Name": str(safe_get(p, "name"))[:22] if p else "—",
-                        "Price": safe_get(q, "c"),
+                        "Name": str(safe_get(p, "name"))[:18] if p else "—",
+                        "Price": px,
                         "Chg %": safe_get(q, "dp"),
+                        "Bias": levels.get("Bias"),
+                        "Entry": levels.get("Entry") if levels.get("Entry") is not None else "—",
+                        "Stop": levels.get("Stop") if levels.get("Stop") is not None else "—",
+                        "Target": levels.get("Target") if levels.get("Target") is not None else "—",
+                        "R:R": levels.get("R:R") if levels.get("R:R") is not None else "—",
                         "P/E": safe_get(ms, "peBasicExclExtraTTM"),
-                        "P/S": safe_get(ms, "psTTM"),
-                        "ROE %": safe_get(ms, "roeTTM"),
-                        "Rev Gr 5Y %": safe_get(ms, "revenueGrowth5Y"),
-                        "D/E": safe_get(ms, "totalDebt/totalEquityAnnual"),
                         "Next Earnings": next_e or "—",
                         "Days to Earn": days_to_earn if days_to_earn is not None else "—",
-                        "Industry": str(safe_get(p, "finnhubIndustry"))[:18] if p else "—",
                     })
                 st.session_state["wl_batch"] = batch_rows
                 st.session_state["wl_batch_time"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-            st.success(f"Batch done · {len(st.session_state.get('wl_batch', []))} names")
+            st.success(f"Batch done · {len(st.session_state.get('wl_batch', []))} names · entry/stop/target included")
         if st.session_state.get("wl_batch"):
             st.caption(f"Last batch: {st.session_state.get('wl_batch_time', '')}")
             st.dataframe(
@@ -1186,6 +1247,75 @@ with tabs[7]:
                 st.write("—")
         st.caption("Swing levels are approximate. Combine with volume and higher-timeframe structure.")
 
+        # --- Entry / Exit framework ---
+        st.markdown("#### Entry & Exit Levels")
+        help_box("entry_exit", "Entry & Exit")
+        st.caption("Framework levels from structure + ATR. Not trade advice — adjust to your plan.")
+
+        # Suggested long framework
+        nearest_sup = None
+        if support:
+            below = [s for s in support if s < latest_close]
+            nearest_sup = max(below) if below else min(support)
+        nearest_res = None
+        if resist:
+            above = [r for r in resist if r > latest_close]
+            nearest_res = min(above) if above else max(resist)
+
+        atr_v = float(latest_atr) if latest_atr else (latest_close * 0.02)
+        # Pullback entry zone: between nearest support and a small ATR buffer, or MA20
+        long_entry = nearest_sup if nearest_sup else (ma20_v if ma20_v else latest_close * 0.98)
+        if ma20_v and nearest_sup:
+            long_entry = min(ma20_v, nearest_sup) if short_trend == "Downtrend" else (nearest_sup + (latest_close - nearest_sup) * 0.3)
+        long_stop = (nearest_sup - atr_v) if nearest_sup else (latest_close - 1.5 * atr_v)
+        long_t1 = nearest_res if nearest_res else (latest_close + 2 * atr_v)
+        long_t2 = (nearest_res + atr_v) if nearest_res else (latest_close + 3.5 * atr_v)
+
+        short_entry = nearest_res if nearest_res else (ma20_v if ma20_v else latest_close * 1.02)
+        short_stop = (nearest_res + atr_v) if nearest_res else (latest_close + 1.5 * atr_v)
+        short_t1 = nearest_sup if nearest_sup else (latest_close - 2 * atr_v)
+
+        bias = "Long-biased structure" if short_trend == "Uptrend" or inter_trend == "Uptrend" else (
+            "Short-biased structure" if short_trend == "Downtrend" or inter_trend == "Downtrend" else "Neutral / range"
+        )
+        st.write(f"**Structure bias (from trends):** {bias}")
+
+        e1, e2, e3, e4 = st.columns(4)
+        e1.metric("Suggested entry (long)", f"${long_entry:,.2f}")
+        e2.metric("Stop (long)", f"${long_stop:,.2f}")
+        e3.metric("Target 1 (long)", f"${long_t1:,.2f}")
+        e4.metric("Target 2 (long)", f"${long_t2:,.2f}")
+
+        risk = latest_close - long_stop if long_stop < latest_close else atr_v
+        reward = long_t1 - latest_close if long_t1 > latest_close else atr_v
+        rr = (reward / risk) if risk and risk > 0 else None
+        if rr:
+            st.caption(f"Illustrative R:R to Target 1 from current price ≈ **{rr:.1f}:1** (using stop ${long_stop:,.2f}).")
+
+        with st.expander("Short-side sketch (if fading strength)"):
+            s1, s2, s3 = st.columns(3)
+            s1.metric("Suggested entry (short)", f"${short_entry:,.2f}")
+            s2.metric("Stop (short)", f"${short_stop:,.2f}")
+            s3.metric("Target 1 (short)", f"${short_t1:,.2f}")
+
+        st.markdown("**Your plan (editable)**")
+        pc1, pc2, pc3, pc4 = st.columns(4)
+        with pc1:
+            user_entry = st.number_input("My entry", value=float(round(long_entry, 2)), step=0.01, key="user_entry")
+        with pc2:
+            user_stop = st.number_input("My stop / exit invalidation", value=float(round(long_stop, 2)), step=0.01, key="user_stop")
+        with pc3:
+            user_t1 = st.number_input("My target / take-profit", value=float(round(long_t1, 2)), step=0.01, key="user_t1")
+        with pc4:
+            if user_entry and user_stop and user_entry != user_stop:
+                user_rr = abs(user_t1 - user_entry) / abs(user_entry - user_stop)
+                st.metric("Your R:R", f"{user_rr:.2f}:1")
+            else:
+                st.metric("Your R:R", "—")
+        st.session_state["plan_entry"] = user_entry
+        st.session_state["plan_stop"] = user_stop
+        st.session_state["plan_target"] = user_t1
+
         st.line_chart(df[["Close", "MA20", "MA50"] + (["MA200"] if "MA200" in df.columns else [])])
 
         c1, c2 = st.columns(2)
@@ -1338,6 +1468,11 @@ with tabs[10]:
 ## Analyst Target
 Mean: ${safe_get(target, 'targetMean')} | High: ${safe_get(target, 'targetHigh')} | Low: ${safe_get(target, 'targetLow')}
 
+## Entry / Exit plan (user)
+- Entry: ${st.session_state.get('plan_entry', '—')}
+- Stop / invalidation: ${st.session_state.get('plan_stop', '—')}
+- Target: ${st.session_state.get('plan_target', '—')}
+
 ## Qualitative
 **Moat:** {st.session_state.get('moat', '')}
 **Bull Case:** {st.session_state.get('bull', '')}
@@ -1422,14 +1557,15 @@ Mean: ${safe_get(target, 'targetMean')} | High: ${safe_get(target, 'targetHigh')
 # ---- Tab 10: Watchlist Batch Dashboard ----
 with tabs[11]:
     st.subheader("Watchlist Batch Dashboard")
-    st.caption("Run from the sidebar (**Run batch dashboard**). Shows quotes, valuation, and next earnings for all watchlist names.")
+    st.caption("Run from the sidebar (**Run batch dashboard**). Includes price, bias, **entry / stop / target**, R:R, and next earnings.")
+    help_box("entry_exit", "Entry & Exit (batch)")
     help_box("watchlist", "Watchlist Batch")
 
     batch = st.session_state.get("wl_batch")
     if not batch:
         st.info("Add tickers in the sidebar watchlist, then click **Run batch dashboard**.")
     else:
-        st.caption(f"Last run: {st.session_state.get('wl_batch_time', '')} · {len(batch)} names")
+        st.caption(f"Last run: {st.session_state.get('wl_batch_time', '')} · {len(batch)} names · levels are framework only, not signals")
         df_b = pd.DataFrame(batch)
         st.dataframe(df_b, use_container_width=True, hide_index=True)
 
@@ -1445,15 +1581,16 @@ with tabs[11]:
         # Compact text summary for copy / future Telegram
         lines = [
             f"Watchlist batch · {st.session_state.get('wl_batch_time', '')}",
-            f"Names: {len(batch)}",
+            f"Names: {len(batch)} · Entry/Stop/Target = structure+ATR framework (not advice)",
             "",
         ]
         for r in batch:
             chg = r.get("Chg %")
             chg_s = f"{chg}%" if chg not in (None, "—") else "—"
             lines.append(
-                f"{r.get('Ticker')}: ${r.get('Price')} ({chg_s}) | P/E {r.get('P/E')} | "
-                f"Earn {r.get('Next Earnings')} ({r.get('Days to Earn')}d)"
+                f"{r.get('Ticker')}: ${r.get('Price')} ({chg_s}) | {r.get('Bias')} | "
+                f"Entry ${r.get('Entry')} / Stop ${r.get('Stop')} / Tgt ${r.get('Target')} "
+                f"(R:R {r.get('R:R')}) | Earn {r.get('Next Earnings')} ({r.get('Days to Earn')}d)"
             )
         summary_txt = "\n".join(lines)
         st.download_button(
